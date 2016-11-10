@@ -17,6 +17,7 @@ extern bool have_galera_enabled;
 extern bool have_flush_engine_logs;
 extern bool have_multi_threaded_slave;
 extern bool have_gtid_slave;
+extern bool have_tokudb;
 
 
 /* History on server */
@@ -88,5 +89,10 @@ write_galera_info(MYSQL *connection);
 bool
 write_slave_info(MYSQL *connection);
 
+void
+lock_tokudb_checkpoint(MYSQL *connection);
+
+void
+unlock_tokudb_checkpoint(MYSQL *connection);
 
 #endif

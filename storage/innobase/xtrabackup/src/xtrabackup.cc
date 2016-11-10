@@ -383,6 +383,10 @@ uint opt_safe_slave_backup_timeout = 0;
 const char *opt_history = NULL;
 my_bool opt_decrypt = FALSE;
 
+/* TokuDB data and log path relative to datadir  */
+const char *tokudb_data_path_to_mysql_datadir = NULL;
+const char *tokudb_log_path_to_mysql_datadir = NULL;
+
 /* Whether xtrabackup_binlog_info should be created on recovery */
 static bool recover_binlog_info;
 

@@ -172,6 +172,9 @@ enum binlog_info_enum { BINLOG_INFO_OFF, BINLOG_INFO_LOCKLESS, BINLOG_INFO_ON,
 
 extern ulong opt_binlog_info;
 
+extern const char *tokudb_data_path_to_mysql_datadir;
+extern const char *tokudb_log_path_to_mysql_datadir;
+
 void xtrabackup_io_throttling(void);
 my_bool xb_write_delta_metadata(const char *filename,
 				const xb_delta_info_t *info);

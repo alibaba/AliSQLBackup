@@ -748,6 +748,22 @@ function require_xtradb()
 }
 
 ########################################################################
+# Return 0 if the server support TokuDB
+########################################################################
+function is_tokudb()
+{
+    [ -n "$TOKUDB_VERSION" ]
+}
+
+#########################################################################
+# Skip the test if not running against TokuDB
+########################################################################
+function require_tokudb()
+{
+    is_tokudb || skip_test "Requires TokuDB"
+}
+
+########################################################################
 # Return 0 if the server has Galera support
 ########################################################################
 function is_galera()

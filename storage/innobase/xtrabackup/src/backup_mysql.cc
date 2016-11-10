@@ -68,6 +68,7 @@ bool have_galera_enabled = false;
 bool have_flush_engine_logs = false;
 bool have_multi_threaded_slave = false;
 bool have_gtid_slave = false;
+bool have_tokudb = false;
 
 /* Kill long selects */
 os_thread_id_t	kill_query_thread_id;
@@ -304,6 +305,77 @@ check_server_version(unsigned long version_number,
 }
 
 /*********************************************************************//**
+Check whether MySQL server support TokuDB engine.
+@return	true if server support TokuDB, false otherwise. */
+static
+bool
+check_tokudb_support(MYSQL *connection)
+{
+	const char *query = "SELECT 'TOKUDB_ENGINES', COUNT(*) FROM "
+		"INFORMATION_SCHEMA.ENGINES WHERE ENGINE LIKE 'TokuDB' AND "
+		"SUPPORT IN ('YES', 'DEFAULT', 'ENABLED')";
+
+	char *tokudb_engine = NULL;
+	bool ret;
+
+	mysql_variable vars[] = {
+		{"TOKUDB_ENGINES", &tokudb_engine},
+		{NULL, NULL}
+	};
+
+	read_mysql_variables(connection, query, vars, true);
+
+	ret = (atoi(tokudb_engine) > 0);
+
+	free_mysql_variables(vars);
+
+	return(ret);
+}
+
+
+/*********************************************************************//**
+Get relative path of c_path, according to p_path, the result relative path
+string is pointed by out. c_path must be under p_path, otherwise report as
+error.
+@return	true on success, false if c_path is not under p_path. */
+bool
+get_relative_path(char *p_path, char *c_path, const char ** out)
+{
+	ut_a(p_path != NULL);
+
+	/* NULL or empty("") path is treated as '.' */
+	if (c_path == NULL || strlen(c_path) == 0) {
+		*out = strdup(".");
+		return true;
+	}
+
+	/* c_path is already a relative path */
+	if (!is_path_separator(*c_path)) {
+		*out = strdup(c_path);
+		return true;
+	}
+
+	/* same path */
+	if (equal_paths(p_path, c_path)) {
+		*out = strdup(".");
+		return true;
+	}
+
+	/* c_path is not under p_path */
+	if (!is_prefix(c_path, p_path)) {
+		return false;
+	}
+
+	c_path += strlen(p_path);
+	if (is_path_separator(*c_path)) {
+		c_path += 1;
+	}
+	*out = strdup(c_path);
+
+	return true;
+}
+
+/*********************************************************************//**
 Receive options important for XtraBackup from MySQL server.
 @return	true on success. */
 bool
@@ -329,6 +401,8 @@ get_mysql_vars(MYSQL *connection)
 	char *innodb_data_home_dir_var = NULL;
 	char *innodb_undo_directory_var = NULL;
 	char *innodb_page_size_var = NULL;
+	char *tokudb_data_dir_var = NULL;
+	char *tokudb_log_dir_var = NULL;
 
 	unsigned long server_version = mysql_get_server_version(connection);
 
@@ -357,6 +431,8 @@ get_mysql_vars(MYSQL *connection)
 		{"innodb_data_home_dir", &innodb_data_home_dir_var},
 		{"innodb_undo_directory", &innodb_undo_directory_var},
 		{"innodb_page_size", &innodb_page_size_var},
+		{"tokudb_data_dir", &tokudb_data_dir_var},
+		{"tokudb_log_dir", &tokudb_log_dir_var},
 		{NULL, NULL}
 	};
 
@@ -417,6 +493,10 @@ get_mysql_vars(MYSQL *connection)
 	if ((gtid_mode_var && strcmp(gtid_mode_var, "ON") == 0) ||
 	    (gtid_slave_pos_var && *gtid_slave_pos_var)) {
 		have_gtid_slave = true;
+	}
+
+	if ((have_tokudb = check_tokudb_support(connection))) {
+		msg_ts("TokuDB storage engine is enabled\n");
 	}
 
 	msg("Using server version %s\n", version_var);
@@ -499,6 +579,20 @@ get_mysql_vars(MYSQL *connection)
 		innobase_page_size = strtoll(
 			innodb_page_size_var, &endptr, 10);
 		ut_ad(*endptr == 0);
+	}
+
+	if (!(ret = get_relative_path(datadir_var, tokudb_data_dir_var,
+				      &tokudb_data_path_to_mysql_datadir))) {
+		msg_ts("tokudb_data_dir:'%s' is not under datadir:'%s'\n",
+		       tokudb_data_dir_var, datadir_var);
+		goto out;
+	}
+
+	if (!(ret = get_relative_path(datadir_var, tokudb_log_dir_var,
+				      &tokudb_log_path_to_mysql_datadir))) {
+		msg_ts("tokudb_log_dir:'%s' is not under datadir:'%s'\n",
+		       tokudb_log_dir_var, datadir_var);
+		goto out;
 	}
 
 out:
@@ -963,6 +1057,39 @@ unlock_all(MYSQL *connection)
 	xb_mysql_query(connection, "UNLOCK TABLES", false);
 
 	msg_ts("All tables unlocked\n");
+}
+
+/*********************************************************************//**
+Acquire TokuDB checkpoint lock. */
+void
+lock_tokudb_checkpoint(MYSQL *connection)
+{
+	/* Must have TokuDB SE enabled. */
+	ut_ad(have_tokudb);
+
+	msg_ts("Acquiring TokuDB checkpoint lock\n");
+	xb_mysql_query(connection, "SET tokudb_checkpoint_lock=ON", false);
+	xb_mysql_query(connection, "SET @old_tokudb_checkpoint_on_flush_logs = "
+		       "@@tokudb_checkpoint_on_flush_logs", false);
+	xb_mysql_query(connection, "SET GLOBAL tokudb_checkpoint_on_flush_logs=OFF",
+		       false);
+	msg_ts("TokuDB checkpoint lock acquired\n");
+}
+
+/*********************************************************************//**
+Release TokuDB checkpoint lock. */
+void
+unlock_tokudb_checkpoint(MYSQL *connection)
+{
+	/* Must have TokuDB SE enabled. */
+	ut_ad(have_tokudb);
+
+	msg_ts("Releasing TokuDB checkpoint lock\n");
+	xb_mysql_query(connection, "SET tokudb_checkpoint_lock=OFF", false);
+	xb_mysql_query(connection, "SET GLOBAL tokudb_checkpoint_on_flush_logs = "
+		       "@old_tokudb_checkpoint_on_flush_logs",
+		       false);
+	msg_ts("TokuDB checkpoint lock released\n");
 }
 
 
@@ -1724,6 +1851,14 @@ backup_cleanup()
 	free(mysql_slave_position);
 	free(mysql_binlog_position);
 	free(buffer_pool_filename);
+
+	if (tokudb_data_path_to_mysql_datadir != NULL) {
+		free((char *)tokudb_data_path_to_mysql_datadir);
+	}
+
+	if (tokudb_log_path_to_mysql_datadir != NULL) {
+		free((char *)tokudb_log_path_to_mysql_datadir);
+	}
 
 	if (mysql_connection) {
 		mysql_close(mysql_connection);

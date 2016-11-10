@@ -25,4 +25,5 @@ INSTALL_SCRIPT(${CMAKE_CURRENT_BINARY_DIR}/xbcloud_osenv
 
 ADD_SUBDIRECTORY(src)
 ADD_SUBDIRECTORY(test)
-ADD_SUBDIRECTORY(doc/source)
+# disable documentation build
+# ADD_SUBDIRECTORY(doc/source)

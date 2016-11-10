@@ -55,6 +55,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common.h"
 #include "backup_copy.h"
 #include "backup_mysql.h"
+#include <regex.h> /* for TokuDB log name */
 
 
 /* list of files to sync for --rsync mode */
@@ -409,6 +410,45 @@ done:
 }
 
 /************************************************************************
+Get next TokuDB file in datadir.
+TokuDB data and log files are both put in datadir, not under database dir(like
+InnoDB or MyISAM), so we add this new function alternative to
+datadir_iter_next(). Maybe in future, TokuDB data files will put in database
+dir, we'll remove this function. */
+static
+bool
+datadir_iter_next_tokudb(datadir_iter_t *it, datadir_node_t *node)
+{
+
+	while (fil_file_readdir_next_file(&it->err, it->datadir_path,
+					  it->dir, &it->dbinfo) == 0) {
+
+		/* TokuDB data and log files are both FILE type, and
+		 we don't need DIR. */
+		if (it->dbinfo.type == OS_FILE_TYPE_DIR
+		    || it->dbinfo.type == OS_FILE_TYPE_UNKNOWN) {
+			continue;
+		}
+
+		/* We found a symlink or a file */
+		make_path_n(2, &it->filepath, &it->filepath_len,
+			  it->datadir_path, it->dbinfo.name);
+		make_path_n(1, &it->filepath_rel, &it->filepath_rel_len,
+			  it->dbinfo.name);
+
+		it->is_file = true;
+		it->is_empty_dir = false;
+
+		datadir_node_fill(node, it);
+
+		return(true);
+	}
+
+	/* datadir iterate finished */
+	return(false);
+}
+
+/************************************************************************
 Interface to read MySQL data file sequentially. One should open file
 with datafile_open to get cursor and close the cursor with
 datafile_close. Cursor can not be shared between multiple
@@ -750,6 +790,31 @@ filename_matches(const char *filename, const char **ext_list)
 	return(false);
 }
 
+/************************************************************************
+Check if file name matches given set of Regular Expressions
+@return true if match. */
+static
+bool
+filename_matches_regex(const char *filename, const char **pattern_list)
+{
+	regex_t re;
+	const char **pattern;
+
+	for (pattern = pattern_list; *pattern; pattern++) {
+		regcomp(&re, *pattern, REG_EXTENDED|REG_NOSUB);
+
+		/* match found */
+		if (regexec(&re, filename, 0, NULL, 0) == 0) {
+			regfree(&re);
+			return(true);
+		}
+
+		/* re must be freed before next compile */
+		regfree(&re);
+	}
+
+	return(false);
+}
 
 /************************************************************************
 Copy data file for backup. Also check if it is allowed to copy by
@@ -1282,8 +1347,89 @@ out:
 }
 
 bool
+backup_tokudb_log_files(const char *from)
+{
+	bool ret = true;
+	datadir_iter_t *it;
+	datadir_node_t node;
+	const char *pattern_list[] = {".*\\.tokulog[[:digit:]]+$", /* redo log */
+				      ".*\\.directory",	   /* table dictionary */
+				      ".*\\.rollback",	   /* undo log */
+				      ".*\\.environment",  /* meta info */
+				      NULL};
+
+	/* Must have TokuDB SE enabled. */
+	ut_ad(have_tokudb);
+
+	msg_ts("Starting to backup TokuDB log files under '%s'\n", from);
+
+	datadir_node_init(&node);
+	it = datadir_iter_new(from);
+
+	while (datadir_iter_next_tokudb(it, &node)) {
+
+		if (!filename_matches_regex(node.filepath, pattern_list)) {
+			continue;
+		}
+
+		if (!(ret = copy_file(ds_data, node.filepath, node.filepath, 1))) {
+			msg_ts("Error: Failed to copy file %s\n", node.filepath);
+			goto out;
+		}
+	}
+
+	msg_ts("Finished backing up TokuDB log files\n");
+
+out:
+	datadir_iter_free(it);
+	datadir_node_free(&node);
+
+	return(ret);
+}
+
+bool
+backup_tokudb_data_files(const char *from)
+{
+	bool ret = true;
+	datadir_iter_t *it;
+	datadir_node_t node;
+	const char *ext_list[] = {"tokudb", NULL};
+
+	/* Must have TokuDB SE enabled. */
+	ut_ad(have_tokudb);
+
+	msg_ts("Starting to backup TokuDB data files under '%s'\n", from);
+
+	datadir_node_init(&node);
+	it = datadir_iter_new(from);
+
+	while (datadir_iter_next_tokudb(it, &node)) {
+
+		if (!filename_matches(node.filepath, ext_list)) {
+			continue;
+		}
+
+		if (!(ret = copy_file(ds_data, node.filepath, node.filepath, 1))) {
+			msg_ts("Error: Failed to copy file %s\n", node.filepath);
+			goto out;
+		}
+	}
+
+	msg_ts("Finished backing up TokuDB data files\n");
+out:
+	datadir_iter_free(it);
+	datadir_node_free(&node);
+
+	return(ret);
+}
+
+bool
 backup_start()
 {
+	if (have_tokudb) {
+		lock_tokudb_checkpoint(mysql_connection);
+	}
+
 	if (!opt_no_lock) {
 		if (opt_safe_slave_backup) {
 			if (!wait_for_safe_slave(mysql_connection)) {
@@ -1350,6 +1496,24 @@ backup_start()
 			"FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS", false);
 	}
 
+	if (have_tokudb) {
+
+		if (!strcmp(fil_path_to_mysql_datadir,
+			    tokudb_log_path_to_mysql_datadir)) {
+
+			/* tokudb_log_dir and datadir are same dir */
+			if (!backup_tokudb_log_files(fil_path_to_mysql_datadir))
+				return(false);
+		}
+		else {
+
+			/* tokudb_log_dir and datadir are different dir */
+			if (!backup_tokudb_log_files(fil_path_to_mysql_datadir) ||
+			    !backup_tokudb_log_files(tokudb_log_path_to_mysql_datadir))
+				return(false);
+		}
+	}
+
 	return(true);
 }
 
@@ -1382,6 +1546,14 @@ backup_finish()
 		if (file_exists("ib_lru_dump")) {
 			copy_file(ds_data, "ib_lru_dump", "ib_lru_dump", 0);
 		}
+	}
+
+	/* Backup TokuDB data files */
+	if (have_tokudb) {
+		if(!backup_tokudb_data_files(tokudb_data_path_to_mysql_datadir)) {
+			return(false);
+		}
+		unlock_tokudb_checkpoint(mysql_connection);
 	}
 
 	msg_ts("Backup created in directory '%s'\n", xtrabackup_target_dir);
